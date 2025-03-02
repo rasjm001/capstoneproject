@@ -1,0 +1,405 @@
+# Import libraries
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import GroupShuffleSplit, GridSearchCV, GroupKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.pipeline import Pipeline
+import traceback
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+
+# Load the dataset
+df = pd.read_csv('./data.csv')  # Adjust path as needed
+
+# Remove duplicates
+df.drop_duplicates(inplace=True)
+
+print(f"Dataset shape after removing duplicates: {df.shape}")
+
+# Functions to extract category and unique file information
+def find_category(file_name):
+    return file_name.split("-")[0] if "-" in file_name else file_name
+
+def find_category_name(file_name):
+    parts = file_name.split("-")
+    return parts[1] if len(parts) > 1 and "-" in file_name else file_name
+
+def extract_unique_file_id(file_name):
+    return file_name.rsplit('-', 1)[0]
+
+# Create new columns
+df["category"] = df["Category"].apply(find_category)
+df["category_name"] = df["Category"].apply(find_category_name)
+df["unique_file_id"] = df["Category"].apply(extract_unique_file_id)
+
+# Create a grouping column for splitting
+# This ensures samples from the same malware family stay together in either train or test
+df['group_id'] = df.apply(lambda row: row['unique_file_id'] if row['Class'] != 'Benign' 
+                          else f"benign_{row.name}", axis=1)
+
+# Encode target variables for different classification tasks - just doing variant now..
+le_class = LabelEncoder()
+le_category = LabelEncoder()
+le_variant = LabelEncoder()
+
+df['Class_encoded'] = le_class.fit_transform(df['Class'])
+df['category_encoded'] = le_category.fit_transform(df['category'])
+df['category_name_encoded'] = le_variant.fit_transform(df['category_name'])
+
+# Print class distribution information
+print("\nClass Distribution:")
+print(df['Class'].value_counts())
+
+print("\nCategory Distribution:")
+print(df['category'].value_counts())
+
+print("\nVariant Distribution:")
+print(df['category_name'].value_counts().head(15))  # Show variants
+
+# Define classifiers with initial settings
+rf_classifier = RandomForestClassifier(
+    n_estimators=100,
+    max_depth=5, 
+    min_samples_split=4, 
+    min_samples_leaf=2, 
+    random_state=42,
+    n_jobs=-1
+)
+
+knn_classifier = KNeighborsClassifier(
+    n_neighbors=11,
+    weights='distance',
+    n_jobs=-1
+)
+
+logistic_classifier = LogisticRegression(
+    penalty='l2', 
+    C=0.5, 
+    solver='saga',
+    max_iter=5000, 
+    random_state=42,
+    multi_class='multinomial'
+)
+
+svm_classifier = SVC(
+    kernel='linear',
+    C=0.1,
+    probability=True, 
+    random_state=42,
+    cache_size=1000,
+    max_iter=1000,
+    decision_function_shape='ovo'
+)
+
+tree_classifier = DecisionTreeClassifier(
+    max_depth=10,
+    min_samples_split=4, 
+    min_samples_leaf=2, 
+    class_weight='balanced',
+    random_state=42
+)
+
+# Classifier dictionary - specifying which classifiers need scaling
+classifiers = {
+    'RandomForest': (rf_classifier, False),
+    'DecisionTree': (tree_classifier, False)
+}
+
+# Hyperparameter grids for each classifier
+param_grids = {
+    'RandomForest': {
+        'n_estimators': [100, 150],
+        'max_depth': [5, 7],
+        'min_samples_split': [4, 6],
+        'min_samples_leaf': [2]
+    },
+    'DecisionTree': {
+        'max_depth': [5, 7],
+        'min_samples_split': [4, 6],
+        'min_samples_leaf': [2]
+    }
+}
+
+# Function to prepare data for a specific classification task
+def prepare_data_for_task(df, task):
+    features = df.drop(columns=['Category', 'Class', 'category', 'category_name', 
+                              'Class_encoded', 'category_encoded', 'category_name_encoded',
+                              'unique_file_id', 'group_id', 'is_conti'], errors='ignore')
+    
+    if task == 'binary':
+        target = df['Class_encoded']
+        encoder = le_class
+    elif task == 'category':
+        target = df['category_encoded']
+        encoder = le_category
+    elif task == 'variant':
+        target = df['category_name_encoded']
+        encoder = le_variant
+    else:
+        raise ValueError(f"Unknown task: {task}")
+    
+    return features, target, encoder
+
+# Function to split data while respecting sample groups
+def split_data(df, X, y):
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.35, random_state=42)
+    train_idx, temp_idx = next(gss.split(X, y, groups=df['group_id']))
+    
+    train_df = df.iloc[train_idx].copy()
+    temp_df = df.iloc[temp_idx].copy()
+    
+    gss_temp = GroupShuffleSplit(n_splits=1, test_size=0.857, random_state=42)
+    val_idx, test_idx = next(gss_temp.split(temp_df, groups=temp_df['group_id']))
+    
+    val_orig_idx = temp_df.index[val_idx]
+    test_orig_idx = temp_df.index[test_idx]
+    
+    val_df = df.loc[val_orig_idx].copy()
+    test_df = df.loc[test_orig_idx].copy()
+    
+    return train_df, val_df, test_df
+
+# Function to plot confusion matrix
+def plot_confusion_matrix(cm, class_names, title):
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(f"{title.replace(' ', '_')}.png")
+    plt.close()
+
+# Function to plot feature importance
+def plot_feature_importance(model, feature_names, title):
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+    else:
+        return None
+    
+    indices = np.argsort(importances)[::-1]
+    top_indices = indices[:15]
+    
+    plt.figure(figsize=(12, 8))
+    plt.title(title)
+    plt.bar(range(len(top_indices)), importances[top_indices])
+    plt.xticks(range(len(top_indices)), [feature_names[i] for i in top_indices], rotation=90)
+    plt.tight_layout()
+    plt.savefig(f"{title.replace(' ', '_')}.png")
+    plt.close()
+    
+    return importances, indices
+
+# Function to train and evaluate models for a specific classification task
+def train_and_evaluate_for_task(df, task):
+    print(f"\n{'='*20} {task.upper()} CLASSIFICATION {'='*20}")
+    
+    cv_splits = 3 if task in ['category', 'variant'] else 5
+    
+    X, y, encoder = prepare_data_for_task(df, task)
+    
+    train_df, val_df, test_df = split_data(df, X, y)
+    
+    X_train = train_df[X.columns]
+    y_train = train_df[y.name]
+    
+    X_val = val_df[X.columns]
+    y_val = val_df[y.name]
+    
+    X_test = test_df[X.columns]
+    y_test = test_df[y.name]
+    
+    print(f"\nData split sizes for {task} classification:")
+    print(f"Training: {X_train.shape[0]} samples")
+    print(f"Validation: {X_val.shape[0]} samples")
+    print(f"Test: {X_test.shape[0]} samples")
+    
+    trained_models = {}
+    
+    for clf_name, (clf_obj, scale_required) in classifiers.items():
+        print(f"\nTraining {clf_name} for {task} classification...")
+        
+        if scale_required:
+            pipeline = Pipeline([('scaler', StandardScaler()), ('clf', clf_obj)])
+            grid = {f'clf__{param}': values for param, values in param_grids[clf_name].items()}
+        else:
+            pipeline = Pipeline([('clf', clf_obj)])
+            grid = {f'clf__{param}': values for param, values in param_grids[clf_name].items()}
+        
+        grid_search = GridSearchCV(
+            pipeline, grid, 
+            cv=GroupKFold(n_splits=cv_splits),
+            scoring='accuracy', 
+            n_jobs=-1, 
+            verbose=1
+        )
+        
+        grid_search.fit(X_train, y_train, groups=train_df['group_id'])
+        best_model = grid_search.best_estimator_
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Cross-validation score: {grid_search.best_score_:.4f}")
+        
+        trained_models[clf_name] = best_model
+        
+        y_test_pred = best_model.predict(X_test)
+        test_accuracy = accuracy_score(y_test, y_test_pred)
+        
+        y_test_labels = encoder.inverse_transform(y_test)
+        y_test_pred_labels = encoder.inverse_transform(y_test_pred)
+        
+        print(f"\nTest Set Classification Report for {clf_name} ({task} classification):")
+        print(classification_report(y_test_labels, y_test_pred_labels, digits=4))
+        print(f"Test accuracy: {test_accuracy:.4f}")
+        
+        cm = confusion_matrix(y_test, y_test_pred)
+        class_names = encoder.classes_
+        
+        if len(class_names) > 20 and task == 'variant':
+            class_counts = np.bincount(y_test)
+            top_indices = np.argsort(class_counts)[::-1][:20]
+            cm_filtered = cm[top_indices, :][:, top_indices]
+            class_names_filtered = [class_names[i] for i in top_indices]
+            plot_confusion_matrix(cm_filtered, class_names_filtered, 
+                                f"{clf_name} - {task.capitalize()} Classification (Top 20 Classes)")
+        else:
+            plot_confusion_matrix(cm, class_names, f"{clf_name} - {task.capitalize()} Classification")
+        
+        if hasattr(best_model, 'named_steps'):
+            model = best_model.named_steps['clf']
+        else:
+            model = best_model
+        
+        if clf_name in ['RandomForest', 'DecisionTree']:
+            importances, indices = plot_feature_importance(model, X.columns, f"{clf_name} - {task.capitalize()} Feature Importance")
+            print(f"\nTop 15 Feature Importances for {clf_name} ({task} classification):")
+            for i in range(min(15, len(X.columns))):
+                print(f"{X.columns[indices[i]]}: {importances[indices[i]]:.4f}")
+    
+    return trained_models
+
+# Function to run comprehensive analysis (only variant classification)
+def run_comprehensive_analysis(df):
+
+    # Commented out binary and category classifications
+    # binary_models = train_and_evaluate_for_task(df, 'binary')
+    # category_models = train_and_evaluate_for_task(df, 'category')
+    variant_models = train_and_evaluate_for_task(df, 'variant')
+    
+    return {
+        # 'binary': binary_models,
+        # 'category': category_models,
+        'variant': variant_models
+    }
+
+# Function for SHAP analysis on variant RF model for Conti
+def analyze_variant_conti_shap(df, variant_rf_model_or_pipeline, task='variant'):
+    print("\n" + "="*20 + " VARIANT RF CONTI SHAP ANALYSIS " + "="*20)
+    
+    X, y, encoder = prepare_data_for_task(df, task)
+    train_df, val_df, test_df = split_data(df, X, y)
+    X_test = test_df[X.columns]
+    y_test = test_df[y.name]
+    
+    if hasattr(variant_rf_model_or_pipeline, 'named_steps'):
+        pipeline = variant_rf_model_or_pipeline
+        variant_rf_model = pipeline.named_steps['clf']
+    else:
+        variant_rf_model = variant_rf_model_or_pipeline
+        pipeline = variant_rf_model_or_pipeline
+    
+    conti_class_name = 'Conti'
+    try:
+        conti_class_index = np.where(encoder.classes_ == conti_class_name)[0][0]
+        print(f"Found Conti class at index {conti_class_index}")
+    except IndexError:
+        print(f"Error: '{conti_class_name}' not found in class labels.")
+        return
+    
+    try:
+        import shap
+        explainer = shap.TreeExplainer(variant_rf_model)
+        
+        if 'scaler' in pipeline.named_steps:
+            X_test_processed = pipeline.named_steps['scaler'].transform(X_test)
+            X_test_for_shap = pd.DataFrame(X_test_processed, columns=X_test.columns)
+        else:
+            X_test_for_shap = X_test
+        
+        sample_size = min(500, X_test_for_shap.shape[0])
+        X_test_sample = X_test_for_shap.sample(sample_size, random_state=42)
+        shap_values = explainer.shap_values(X_test_sample)
+        
+        # Handle different SHAP value formats
+        if isinstance(shap_values, list):
+            shap.summary_plot(shap_values[conti_class_index], X_test_sample, plot_type="bar")
+            plt.savefig("Variant_RF_Conti_SHAP_Bar.png")
+            plt.close()
+            shap.summary_plot(shap_values[conti_class_index], X_test_sample)
+            plt.savefig("Variant_RF_Conti_SHAP_Details.png")
+            plt.close()
+        elif isinstance(shap_values, np.ndarray) and len(shap_values.shape) == 3:
+            conti_shap_values = shap_values[:, :, conti_class_index]
+            shap.summary_plot(conti_shap_values, X_test_sample, plot_type="bar")
+            plt.savefig("Variant_RF_Conti_SHAP_Bar.png")
+            plt.close()
+            shap.summary_plot(conti_shap_values, X_test_sample)
+            plt.savefig("Variant_RF_Conti_SHAP_Details.png")
+            plt.close()
+        else:
+            print("SHAP values not in expected format.")
+            return
+        
+        # Analyze correctly classified Conti samples
+        y_pred = pipeline.predict(X_test)
+        conti_correct_idx = np.where((y_test == conti_class_index) & (y_pred == conti_class_index))[0]
+        if len(conti_correct_idx) > 0:
+            correct_samples = X_test_for_shap.iloc[conti_correct_idx]
+            correct_shap_values = explainer.shap_values(correct_samples)
+            if isinstance(correct_shap_values, list):
+                shap.summary_plot(correct_shap_values[conti_class_index], correct_samples)
+                plt.savefig("Variant_RF_Conti_Correct_SHAP.png")
+                plt.close()
+            elif isinstance(correct_shap_values, np.ndarray) and len(correct_shap_values.shape) == 3:
+                correct_conti_shap_values = correct_shap_values[:, :, conti_class_index]
+                shap.summary_plot(correct_conti_shap_values, correct_samples)
+                plt.savefig("Variant_RF_Conti_Correct_SHAP.png")
+                plt.close()
+            else:
+                print("Correct SHAP values not in expected format.")
+        else:
+            print("No correctly classified Conti samples found.")
+        
+        print("Variant RF Conti SHAP analysis complete.")
+    except Exception as e:
+        print(f"Error in SHAP analysis: {str(e)}")
+
+
+# Main execution
+if __name__ == "__main__":
+    print("Starting comprehensive malware classification analysis...")
+    print(f"Dataset initial shape: {df.shape}")
+    
+    df['is_conti'] = df['category_name'].apply(lambda x: 1 if str(x).lower() == 'conti' else 0)
+    
+    # Commented out Conti-specific binary analysis
+    # if sum(df['is_conti']) > 0:
+    #     print("\nRunning Conti-specific feature importance analysis...")
+    #     conti_model, top_conti_features = analyze_conti_variant_features(df)
+    # else:
+    #     print("\nWarning: 'Conti' variant not found in the dataset")
+    
+    print("\nRunning comprehensive analysis (variant classification only)...")
+    all_models = run_comprehensive_analysis(df)
+    
+    if 'RandomForest' in all_models['variant'] and 'Conti' in le_variant.classes_:
+        analyze_variant_conti_shap(df, all_models['variant']['RandomForest'])
+    print("\nAnalysis complete!")
