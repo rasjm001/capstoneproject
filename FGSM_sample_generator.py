@@ -65,7 +65,7 @@ tasks = ['binary', 'category', 'variant']
 classifiers = ['LogisticRegression', 'RandomForest']
 trained_models = {task: {clf: joblib.load(f"{task}_{clf}_model.pkl") for clf in classifiers} for task in tasks}
 
-# Adversarial Sample Generation
+# Adversarial Sample Generation Setup
 np.random.seed(42)
 
 # Select 100 random Conti samples from test set
@@ -75,89 +75,126 @@ selected_indices = np.random.choice(conti_indices, 100, replace=False)
 X_test_conti = X_test.loc[selected_indices]
 y_test_conti_binary = y_test_binary.loc[selected_indices]
 y_test_conti_category = y_test_category.loc[selected_indices]
-y_test_conti_variant = y_test_variant.loc[selected_indices]  # Fixed here
+y_test_conti_variant = y_test_variant.loc[selected_indices]
 
 # Save original samples to CSV
 X_test_conti.to_csv("original_fgsm_samples.csv", index=False)
 
-# Define features not to modify
+# Define features not to modify (these will remain unchanged)
 features_not_to_modify = ['svcscan.nservices', 'pslist.avg_threads', 'handles.nthread', 'dlllist.avg_dlls_per_proc', 
                           'handles.nevent', 'handles.ndirectory', 'malfind.commitCharge']
 indices_not_to_modify = [X_test.columns.get_loc(feat) for feat in features_not_to_modify]
-indices_to_perturb = [i for i in range(X_test.shape[1]) if i not in indices_not_to_modify]
 
-# Use variant LR model for FGSM
-scaler = trained_models['variant']['LogisticRegression'].named_steps['scaler']
-logistic_clf = trained_models['variant']['LogisticRegression'].named_steps['clf']
+# Comment out the original features_to_modify
+# features_to_modify = ['ldrmodules.not_in_load', 'handles.nkey']
+# indices_to_modify = [X_test.columns.get_loc(feat) for feat in features_to_modify]
+# indices_not_to_perturb = [i for i in range(X_test.shape[1]) if i not in indices_to_modify]
 
-# Scale the Conti samples
-X_test_conti_scaled = scaler.transform(X_test_conti)
+# Epsilon values to test
+epsilon_values = [0.01, 0.1, 0.2, 0.3]
 
-# Create SklearnClassifier for ART
-classifier = SklearnClassifier(model=logistic_clf)
+# For comparison of different LR models
+source_models = ['binary', 'category', 'variant']
 
-# Define FGSM attack
-fgsm = FastGradientMethod(estimator=classifier, eps=0.5)
-
-# Generate adversarial samples
-X_test_adv_scaled = fgsm.generate(X_test_conti_scaled)
-
-# Restrict perturbation to all features except those in features_not_to_modify
-perturbation = X_test_adv_scaled - X_test_conti_scaled
-perturbation[:, indices_not_to_modify] = 0
-X_test_adv_scaled = X_test_conti_scaled + perturbation
-
-# Inverse transform to original space
-X_test_adv_raw = scaler.inverse_transform(X_test_adv_scaled)
-
-# Convert to DataFrame with feature names
-X_test_adv_df = pd.DataFrame(X_test_adv_raw, columns=feature_cols)
-
-# Save modified samples to CSV
-X_test_adv_df.to_csv("modified_fgsm_samples.csv", index=False)
-
-# Evaluate adversarial samples on LR and RF for all tasks
-for task in tasks:
-    print(f"\nEvaluating adversarial samples on {task} classification...")
-    for clf_name in classifiers:
-        model = trained_models[task][clf_name]
+# Iterate over source models and epsilon values
+for source_model in source_models:
+    for eps in epsilon_values:
+        print(f"\nGenerating adversarial samples with {source_model} LR model, epsilon={eps}")
         
-        if task == 'binary':
-            y_test_task = y_test_conti_binary
-            encoder = le_class
-        elif task == 'category':
-            y_test_task = y_test_conti_category
-            encoder = le_category
-        elif task == 'variant':
-            y_test_task = y_test_conti_variant
-            encoder = le_catname
+        # Use the binary LR model for FGSM (as per original code)
+        scaler = trained_models['binary']['LogisticRegression'].named_steps['scaler']
+        logistic_clf = trained_models['binary']['LogisticRegression'].named_steps['clf']
         
-        class_names = list(encoder.classes_)
-        label_values = list(range(len(class_names)))
+        # Scale the Conti samples
+        X_test_conti_scaled = scaler.transform(X_test_conti)
         
-        y_pred_adv = model.predict(X_test_adv_df)
+        # Create SklearnClassifier for ART
+        classifier = SklearnClassifier(model=logistic_clf)
         
-        print(f"{task} encoder classes: {encoder.classes_}")
-        print(f"Raw true labels (first 5): {y_test_task[:5]}")
-        print(f"Raw predicted labels (first 5): {y_pred_adv[:5]}")
+        # Define FGSM attack with current epsilon
+        fgsm = FastGradientMethod(estimator=classifier, eps=eps)
         
-        print(f"\nClassification Report for {clf_name} on {task} task (Adversarial):")
-        print(classification_report(y_test_task, y_pred_adv, 
-                                   labels=label_values, target_names=class_names, 
-                                   digits=4, zero_division=0))
+        # Generate adversarial samples
+        X_test_adv_scaled = fgsm.generate(X_test_conti_scaled)
         
-        evasion_count = sum(y_pred_adv != y_test_task)
-        print(f"Total number of evasion samples for {clf_name} on {task} task: {evasion_count} out of {len(y_test_task)}")
+        # Restrict perturbation: set to 0 for features in features_not_to_modify
+        perturbation = X_test_adv_scaled - X_test_conti_scaled
+        perturbation[:, indices_not_to_modify] = 0  # Set perturbation to 0 for features not to modify
+        X_test_adv_scaled = X_test_conti_scaled + perturbation
         
-        benign_label = [cls for cls in encoder.classes_ if 'benign' in cls.lower()][0]
-        benign_encoded = encoder.transform([benign_label])[0]
-        benign_misclassified = sum(y_pred_adv == benign_encoded)
-        print(f"Number of Conti samples misclassified as {benign_label}: {benign_misclassified}")
+        # Inverse transform to original space
+        X_test_adv_raw = scaler.inverse_transform(X_test_adv_scaled)
         
-        print(f"\nPrediction Distribution for {clf_name} on {task} task:")
-        pred_counts = pd.Series(y_pred_adv).value_counts().reindex(label_values, fill_value=0)
-        pred_dist = pd.DataFrame({
-            'Variant': class_names,
-            'Count': pred_counts.values
-        })
-        print(pred_dist.to_string(index=False))
+        # Convert to DataFrame with feature names
+        X_test_adv_df = pd.DataFrame(X_test_adv_raw, columns=feature_cols)
+        
+        # Save modified samples to CSV with model and epsilon in filename
+        X_test_adv_df.to_csv(f"modified_fgsm_samples_{source_model}_eps_{eps}.csv", index=False)
+        
+        # List to store misclassification distribution results for this combination
+        misclassification_results = []
+        
+        # Evaluate adversarial samples on LR and RF for all tasks
+        for task in tasks:
+            print(f"\nEvaluating on {task} classification (Source: {source_model}, Epsilon: {eps})")
+            for clf_name in classifiers:
+                model = trained_models[task][clf_name]
+                
+                if task == 'binary':
+                    y_test_task = y_test_conti_binary
+                    encoder = le_class
+                elif task == 'category':
+                    y_test_task = y_test_conti_category
+                    encoder = le_category
+                elif task == 'variant':
+                    y_test_task = y_test_conti_variant
+                    encoder = le_catname
+                
+                class_names = list(encoder.classes_)
+                label_values = list(range(len(class_names)))
+                
+                y_pred_adv = model.predict(X_test_adv_df)
+                
+                print(f"{task} encoder classes: {encoder.classes_}")
+                print(f"Raw true labels (first 5): {y_test_task[:5]}")
+                print(f"Raw predicted labels (first 5): {y_pred_adv[:5]}")
+                
+                print(f"\nClassification Report for {clf_name} on {task} task (Adversarial):")
+                print(classification_report(y_test_task, y_pred_adv, 
+                                           labels=label_values, target_names=class_names, 
+                                           digits=4, zero_division=0))
+                
+                evasion_count = sum(y_pred_adv != y_test_task)
+                print(f"Total number of evasion samples for {clf_name}: {evasion_count} out of {len(y_test_task)}")
+                
+                benign_label = [cls for cls in encoder.classes_ if 'benign' in cls.lower()][0]
+                benign_encoded = encoder.transform([benign_label])[0]
+                benign_misclassified = sum(y_pred_adv == benign_encoded)
+                print(f"Number of Conti samples misclassified as {benign_label}: {benign_misclassified}")
+                
+                print(f"\nPrediction Distribution for {clf_name} on {task} task:")
+                pred_counts = pd.Series(y_pred_adv).value_counts().reindex(label_values, fill_value=0)
+                pred_dist = pd.DataFrame({
+                    'Variant': class_names,
+                    'Count': pred_counts.values
+                })
+                print(pred_dist.to_string(index=False))
+                
+                # Store misclassification distribution with additional metrics
+                for variant, count in zip(class_names, pred_counts.values):
+                    misclassification_results.append({
+                        'Source_Model': source_model,
+                        'Epsilon': eps,
+                        'Task': task,
+                        'Eval_Model': clf_name,
+                        'Variant': variant,
+                        'Count': count,
+                        'Evasion_Count': evasion_count,
+                        'Benign_Count': benign_misclassified if variant == benign_label else 0
+                    })
+        
+        # Save misclassification distribution to CSV for this model-epsilon pair
+        misclassification_df = pd.DataFrame(misclassification_results)
+        csv_filename = f"misclassification_distribution_{source_model}_eps_{eps}.csv"
+        misclassification_df.to_csv(csv_filename, index=False)
+        print(f"\nMisclassification distribution saved to '{csv_filename}'")
