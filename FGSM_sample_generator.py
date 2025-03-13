@@ -5,6 +5,16 @@ from sklearn.metrics import classification_report
 import joblib
 from art.attacks.evasion import FastGradientMethod
 from art.estimators.classification import SklearnClassifier
+from sklearn.model_selection import GroupShuffleSplit
+
+#uses Art Module for FGSM Process
+#loads pretrained models for testings and FGSM
+#uses variant multiclass LR classifier for FGSM process ( can be changed)
+#excludes features in "features_not_to_modify" from FGSM process
+#generates CSV of adversarial samples and original samples for comparisions
+# tests the adversarial samples agains the pretrained models (can be changed)
+# shows accuracy drop of the models
+
 
 # Load the dataset
 df = pd.read_csv('./data.csv')  # Adjust path as needed
@@ -43,7 +53,6 @@ feature_cols = [col for col in df.columns if col not in ['Category', 'Class', 'c
                                                          'unique_file_id', 'group_id']]
 
 # Split the dataset
-from sklearn.model_selection import GroupShuffleSplit
 gss = GroupShuffleSplit(n_splits=1, test_size=0.35, random_state=42)
 train_idx, temp_idx = next(gss.split(df, groups=df['group_id']))
 train_df = df.iloc[train_idx]
@@ -61,8 +70,8 @@ y_test_category = test_df['category_encoded']
 y_test_variant = test_df['category_name_encoded']
 
 # Load pre-trained models
-tasks = ['binary', 'category', 'variant']
-classifiers = ['LogisticRegression', 'RandomForest']
+tasks = ['variant']
+classifiers = ['LogisticRegression', 'RandomForest', "KNN", "DecisionTree"]
 trained_models = {task: {clf: joblib.load(f"{task}_{clf}_model.pkl") for clf in classifiers} for task in tasks}
 
 # Adversarial Sample Generation Setup
@@ -81,41 +90,57 @@ y_test_conti_variant = y_test_variant.loc[selected_indices]
 X_test_conti.to_csv("original_fgsm_samples.csv", index=False)
 
 # Define features not to modify (these will remain unchanged)
-features_not_to_modify = ['svcscan.nservices', 'pslist.avg_threads', 'handles.nthread', 'dlllist.avg_dlls_per_proc', 
-                          'handles.nevent', 'handles.ndirectory', 'malfind.commitCharge']
+features_not_to_modify = ["svcscan.nservices", "dlllist.avg_dlls_per_proc", "svcscan.kernel_drivers", "handles.nsection", "svcscan.shared_process_services", "malfind.commitCharge"]
 indices_not_to_modify = [X_test.columns.get_loc(feat) for feat in features_not_to_modify]
 
-# Comment out the original features_to_modify
-# features_to_modify = ['ldrmodules.not_in_load', 'handles.nkey']
-# indices_to_modify = [X_test.columns.get_loc(feat) for feat in features_to_modify]
-# indices_not_to_perturb = [i for i in range(X_test.shape[1]) if i not in indices_to_modify]
-
 # Epsilon values to test
-epsilon_values = [0.01, 0.1, 0.2, 0.3]
+epsilon_values = [0.1, 0.2, 0.3]
 
 # For comparison of different LR models
-source_models = ['binary', 'category', 'variant']
+source_models = ['variant']
 
-# Iterate over source models and epsilon values
+# Iterate over source models
 for source_model in source_models:
+    # Use the variant LR model for FGSM
+    scaler = trained_models['variant']['LogisticRegression'].named_steps['scaler']
+    logistic_clf = trained_models['variant']['LogisticRegression'].named_steps['clf']
+    
+    # Scale the Conti samples
+    X_test_conti_scaled = scaler.transform(X_test_conti)
+    
+    # Create SklearnClassifier for ART
+    classifier = SklearnClassifier(model=logistic_clf)
+    
+    # Get the encoded value for 'Benign' in the variant task
+    benign_encoded = le_catname.transform(['Benign'])[0]
+    # Create target labels array, setting all samples to target 'Benign'
+    y_target = np.full(len(X_test_conti_scaled), benign_encoded)
+    
+    # Calculate clean accuracy for each classifier before adversarial attacks
+    clean_accuracies = {}
+    for task in tasks:
+        for clf_name in classifiers:
+            model = trained_models[task][clf_name]
+            y_pred_clean = model.predict(X_test_conti)
+            if task == 'binary':
+                y_test_task = y_test_conti_binary
+            elif task == 'category':
+                y_test_task = y_test_conti_category
+            elif task == 'variant':
+                y_test_task = y_test_conti_variant
+            clean_accuracy = (y_pred_clean == y_test_task).mean()
+            clean_accuracies[(task, clf_name)] = clean_accuracy
+            print(f"Clean Accuracy for {clf_name} on {task} task: {clean_accuracy:.4f}")
+    
+    # Iterate over epsilon values
     for eps in epsilon_values:
         print(f"\nGenerating adversarial samples with {source_model} LR model, epsilon={eps}")
         
-        # Use the binary LR model for FGSM (as per original code)
-        scaler = trained_models['binary']['LogisticRegression'].named_steps['scaler']
-        logistic_clf = trained_models['binary']['LogisticRegression'].named_steps['clf']
+        # Define FGSM attack with current epsilon, set to targeted
+        fgsm = FastGradientMethod(estimator=classifier, eps=eps, targeted=True)
         
-        # Scale the Conti samples
-        X_test_conti_scaled = scaler.transform(X_test_conti)
-        
-        # Create SklearnClassifier for ART
-        classifier = SklearnClassifier(model=logistic_clf)
-        
-        # Define FGSM attack with current epsilon
-        fgsm = FastGradientMethod(estimator=classifier, eps=eps)
-        
-        # Generate adversarial samples
-        X_test_adv_scaled = fgsm.generate(X_test_conti_scaled)
+        # Generate adversarial samples targeting 'Benign'
+        X_test_adv_scaled = fgsm.generate(X_test_conti_scaled, y=y_target)
         
         # Restrict perturbation: set to 0 for features in features_not_to_modify
         perturbation = X_test_adv_scaled - X_test_conti_scaled
@@ -134,7 +159,7 @@ for source_model in source_models:
         # List to store misclassification distribution results for this combination
         misclassification_results = []
         
-        # Evaluate adversarial samples on LR and RF for all tasks
+        # Evaluate adversarial samples on all classifiers for the variant task
         for task in tasks:
             print(f"\nEvaluating on {task} classification (Source: {source_model}, Epsilon: {eps})")
             for clf_name in classifiers:
@@ -155,23 +180,24 @@ for source_model in source_models:
                 
                 y_pred_adv = model.predict(X_test_adv_df)
                 
-                print(f"{task} encoder classes: {encoder.classes_}")
-                print(f"Raw true labels (first 5): {y_test_task[:5]}")
-                print(f"Raw predicted labels (first 5): {y_pred_adv[:5]}")
+                # Calculate adversarial accuracy
+                adv_accuracy = (y_pred_adv == y_test_task).mean()
+                clean_accuracy = clean_accuracies[(task, clf_name)]
+                accuracy_drop = clean_accuracy - adv_accuracy
+                print(f"Adversarial Accuracy for {clf_name}: {adv_accuracy:.4f}")
+                print(f"Accuracy Drop for {clf_name}: {accuracy_drop:.4f}")
                 
-                print(f"\nClassification Report for {clf_name} on {task} task (Adversarial):")
-                print(classification_report(y_test_task, y_pred_adv, 
-                                           labels=label_values, target_names=class_names, 
-                                           digits=4, zero_division=0))
-                
+                # Calculate evasion count
                 evasion_count = sum(y_pred_adv != y_test_task)
                 print(f"Total number of evasion samples for {clf_name}: {evasion_count} out of {len(y_test_task)}")
                 
+                # Calculate benign misclassifications
                 benign_label = [cls for cls in encoder.classes_ if 'benign' in cls.lower()][0]
                 benign_encoded = encoder.transform([benign_label])[0]
                 benign_misclassified = sum(y_pred_adv == benign_encoded)
                 print(f"Number of Conti samples misclassified as {benign_label}: {benign_misclassified}")
                 
+                # Prediction distribution
                 print(f"\nPrediction Distribution for {clf_name} on {task} task:")
                 pred_counts = pd.Series(y_pred_adv).value_counts().reindex(label_values, fill_value=0)
                 pred_dist = pd.DataFrame({
@@ -190,7 +216,10 @@ for source_model in source_models:
                         'Variant': variant,
                         'Count': count,
                         'Evasion_Count': evasion_count,
-                        'Benign_Count': benign_misclassified if variant == benign_label else 0
+                        'Benign_Count': benign_misclassified if variant == benign_label else 0,
+                        'Clean_Accuracy': clean_accuracy,
+                        'Adversarial_Accuracy': adv_accuracy,
+                        'Accuracy_Drop': accuracy_drop
                     })
         
         # Save misclassification distribution to CSV for this model-epsilon pair
