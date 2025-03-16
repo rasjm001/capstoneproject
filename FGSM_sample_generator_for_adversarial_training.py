@@ -8,7 +8,7 @@ from art.estimators.classification import SklearnClassifier
 from sklearn.model_selection import GroupShuffleSplit
 
 
-#test samples - targeted FGSM - variant model
+#test samples - targeted FGSM - variant model - uses conti samples only
 
 #uses Art Module for FGSM Process
 #loads pretrained models for testings and FGSM
@@ -17,6 +17,7 @@ from sklearn.model_selection import GroupShuffleSplit
 #generates CSV of adversarial samples and original samples for comparisions
 # tests the adversarial samples agains the pretrained models (can be changed)
 # shows accuracy drop of the models
+
 
 
 # Load the dataset
@@ -66,13 +67,15 @@ val_idx, test_idx = next(gss_temp.split(temp_df, groups=temp_df['group_id']))
 validation_df = temp_df.iloc[val_idx]
 test_df = temp_df.iloc[test_idx]
 
+
+#change this to 'train' instead of test for training samples
 # Extract test features and targets for all tasks
 X_test = test_df[feature_cols]
 y_test_binary = test_df['Class_encoded']
 y_test_category = test_df['category_encoded']
 y_test_variant = test_df['category_name_encoded']
 
-# Load pre-trained models
+# Load pre-trained models ( variante category or binary)
 tasks = ['variant']
 classifiers = ['LogisticRegression', 'RandomForest', "KNN", "DecisionTree"]
 trained_models = {task: {clf: joblib.load(f"{task}_{clf}_model.pkl") for clf in classifiers} for task in tasks}
@@ -80,6 +83,8 @@ trained_models = {task: {clf: joblib.load(f"{task}_{clf}_model.pkl") for clf in 
 # Adversarial Sample Generation Setup
 np.random.seed(42)
 
+
+#if doing the randome malware samples change to  malware_indices = train_df[train_df['Class'] != 'Benign'].index a
 # Select 500 random Conti samples from test set 
 conti_encoded = le_catname.transform(['Conti'])[0]
 conti_indices = test_df[test_df['category_name_encoded'] == conti_encoded].index
